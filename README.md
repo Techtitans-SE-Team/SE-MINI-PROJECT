@@ -1,5 +1,3 @@
-# SE-MINI-PROJECT
-Doctor Prescription to Multilingual Video Reminder and  Instruction Generator  
 # Doctor Prescription to Multilingual Video Reminder and Instruction Generator
 
 **Project ID:** 41\
@@ -253,17 +251,16 @@ The repository should contain project documentation such as:
 -   Requirement Traceability Matrix
 -   Maintenance plan
 
-## Team Contributions
+## Team Members & Roles
 
-  Member     Responsibility
-  ---------- ---------------------------------------
-  Member 1   Project Lead /Requirements Coordinator 
-  Member 2   Requirements / assigned functionality
-  Member 3   System / Requirements Designer  
-  Member 4   Quality, Security & Traceability Lead
+| Team Member | Role / Assigned Functionality |
+|---|---|
+| **Asha** | **Quality, Security & Traceability Lead** — Non-functional requirements, security, quality, other requirements, glossary, field layouts, reports, and requirement traceability |
+| **Chaya** | **Project Lead / Requirements Coordinator** — Overall requirements coordination, project documentation, and SRS contribution |
+| **Ananya Dharani AP** | **Requirements Analyst** — Requirements analysis, product functions, overall description, assumptions/dependencies, and requirements documentation |
+| **Aarti Panchal** | **System / Requirements Designer** — External interfaces, analysis/use-case models, system features, and functional requirements |
 
-Replace the placeholders with the actual team members, SRNs, and
-assigned functionality.
+Every team member is responsible for contributing to implementation and maintaining evidence of individual contribution through Git commits and pull requests.
 
 ## Project Status
 
