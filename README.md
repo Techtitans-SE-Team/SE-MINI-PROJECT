@@ -256,7 +256,7 @@ The repository should contain project documentation such as:
 | Team Member | Role / Assigned Functionality |
 |---|---|
 | **Asha** | **Quality, Security & Traceability Lead** — Non-functional requirements, security, quality, other requirements, glossary, field layouts, reports, and requirement traceability |
-| **Chaya** | **Project Lead / Requirements Coordinator** — Overall requirements coordination, project documentation, and SRS contribution |
+| **Chaya** | **Requirements Coordinator** — Overall requirements coordination, project documentation, and SRS contribution |
 | **Ananya Dharani AP** | **Requirements Analyst** — Requirements analysis, product functions, overall description, assumptions/dependencies, and requirements documentation |
 | **Aarti Panchal** | **System / Requirements Designer** — External interfaces, analysis/use-case models, system features, and functional requirements |
 
