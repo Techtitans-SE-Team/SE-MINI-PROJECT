@@ -1,0 +1,949 @@
+From 0f587eeb00e04620e785c7ec02bb1598c60d236c Mon Sep 17 00:00:00 2001
+From: Member 1 <member1@example.com>
+Date: Mon, 16 Nov 2026 05:01:55 +0000
+Subject: [PATCH 2/2] feat(backend): Sprint 2 - prescription upload, OCR
+ extraction, medicine review and verification APIs + tests
+
+---
+ backend/README.md                             |  48 ++++
+ backend/app/routers/prescriptions.py          | 252 ++++++++++++++++--
+ backend/app/schemas.py                        |  42 +++
+ backend/app/services/extraction.py            |  98 +++++++
+ backend/app/services/ocr.py                   |  35 +++
+ backend/tests/test_extraction.py              |  45 ++++
+ backend/tests/test_upload_ocr.py              | 207 ++++++++++++++
+ .../sprint2/backend_test_results.txt          |  85 ++++++
+ 8 files changed, 794 insertions(+), 18 deletions(-)
+ create mode 100644 backend/README.md
+ create mode 100644 backend/app/services/extraction.py
+ create mode 100644 backend/app/services/ocr.py
+ create mode 100644 backend/tests/test_extraction.py
+ create mode 100644 backend/tests/test_upload_ocr.py
+ create mode 100644 documentation/sprint2/backend_test_results.txt
+
+diff --git a/backend/README.md b/backend/README.md
+new file mode 100644
+index 0000000..ef528a2
+--- /dev/null
++++ b/backend/README.md
+@@ -0,0 +1,48 @@
++# Backend – Doctor Prescription Reminder (Member 1)
++
++FastAPI + SQLAlchemy backend on the MySQL schema in `/database/schema` (Member 3).
++
++## Run
++```bash
++cd backend
++python -m venv venv && source venv/bin/activate        # Windows: venv\Scripts\activate
++pip install -r requirements.txt
++cp .env.example .env                                   # set DATABASE_URL and SECRET_KEY
++# run the SQL scripts in /database/schema first (01 -> 08)
++python -m scripts.create_admin "Admin" admin@example.com 'Admin@12345'
++uvicorn app.main:app --reload                          # docs at http://localhost:8000/docs
++pytest                                                 # 84 tests, uses in-memory SQLite
++```
++OCR needs the **Tesseract** binary (Windows: UB-Mannheim installer, Ubuntu: `apt install tesseract-ocr`). Scanned PDFs also need **poppler**. If OCR is unavailable the upload still succeeds, the file is marked `Failed` and the doctor enters medicines manually.
++
++## Sprint 1 – APIs
++| Method | Path | Who | Purpose |
++|---|---|---|---|
++| POST | /auth/register | public | Register Patient or Doctor (Admin cannot self-register) |
++| POST | /auth/login | public | Returns JWT + role |
++| GET | /auth/me | any | Current user |
++| GET/PUT | /patients/me | Patient | View / update own profile |
++| GET | /patients?search= | Doctor, Admin | Patient picker (name + language only) |
++| GET | /patients/{id} | Admin, self, Doctor who prescribed | Full profile |
++| POST | /prescriptions | Doctor | Create (always `Pending`) |
++| GET | /prescriptions, /prescriptions/{id} | role-scoped | Doctor: own · Patient: own **verified** · Admin: all |
++| PUT | /prescriptions/{id} | owning Doctor | Edit (blocked once verified) |
++| POST | /prescriptions/{id}/verify | owning Doctor | `{"action": "verify"|"reject"}` |
++| GET | /admin/users, /admin/stats | Admin | Admin dashboard data |
++
++## Sprint 2 – APIs
++| Method | Path | Purpose |
++|---|---|---|
++| POST | /prescriptions/upload | multipart: `patient_id`, `file` (jpg/png/pdf, ≤5 MB), optional `prescription_date`. Validates, stores, runs OCR, extracts medicines |
++| POST | /prescriptions/{id}/reprocess | Re-run OCR on the stored file |
++| GET | /prescriptions/{id}/file | Download the uploaded file (authorised users only) |
++| GET/POST | /prescriptions/{id}/medicines | List extracted / add manual medicine |
++| PUT/DELETE | /prescriptions/{id}/medicines/{mid} | Doctor corrects extracted data |
++
++Status flow: `Uploaded → Processing → Pending Verification → Verified | Rejected`. Medicines with any missing field are `Needs Review`; verification is refused (409) until every medicine is corrected/confirmed.
++
++## Design notes / assumptions
++- Passwords: bcrypt. Tokens: JWT (60 min). Same error for unknown email and wrong password.
++- A patient can only see their prescriptions after a doctor verifies them.
++- The `prescriptions` row mirrors its first medicine; all medicines live in `medicines`.
++- Uploaded files are stored under random names, with type checked by extension **and** magic bytes.
+diff --git a/backend/app/routers/prescriptions.py b/backend/app/routers/prescriptions.py
+index 304d549..ba4d13b 100644
+--- a/backend/app/routers/prescriptions.py
++++ b/backend/app/routers/prescriptions.py
+@@ -1,20 +1,37 @@
+-from fastapi import APIRouter, Depends, HTTPException, status
++import uuid
++from datetime import date
++from pathlib import Path
++
++from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
++from fastapi.responses import FileResponse
+ from sqlalchemy import select
+ from sqlalchemy.orm import Session
+ 
++from ..config import get_settings
+ from ..database import get_db
+ from ..deps import get_current_user, require_roles
+-from ..models import (PROC_PENDING_VERIFICATION, PROC_REJECTED, PROC_VERIFIED, ROLE_ADMIN, ROLE_DOCTOR,
+-                      ROLE_PATIENT, VERIFICATION_PENDING, VERIFICATION_REJECTED, VERIFICATION_VERIFIED,
+-                      Patient, Prescription, User)
+-from ..schemas import PrescriptionCreate, PrescriptionOut, PrescriptionUpdate, VerifyRequest
++from ..models import (CONFIRMED, EXTRACTED, FILE_FAILED, FILE_PROCESSED, FILE_PROCESSING, NEEDS_REVIEW,
++                      PROC_PENDING_VERIFICATION, PROC_PROCESSING, PROC_REJECTED, PROC_UPLOADED, PROC_VERIFIED,
++                      ROLE_ADMIN, ROLE_DOCTOR, ROLE_PATIENT, VERIFICATION_PENDING, VERIFICATION_REJECTED,
++                      VERIFICATION_VERIFIED, Medicine, Patient, Prescription, PrescriptionFile, User)
++from ..schemas import (MedicineCreate, MedicineOut, MedicineUpdate, PrescriptionCreate, PrescriptionOut,
++                       PrescriptionUpdate, UploadResponse, VerifyRequest)
++from ..services import ocr
++from ..services.extraction import NOT_DETECTED, extract_medicines
+ 
+ router = APIRouter(prefix="/prescriptions", tags=["Prescriptions"])
+ 
++ALLOWED_TYPES = {  # extension -> (file_type, magic-byte check)
++    "jpg": ("jpg", lambda b: b.startswith(b"\xff\xd8\xff")),
++    "jpeg": ("jpg", lambda b: b.startswith(b"\xff\xd8\xff")),
++    "png": ("png", lambda b: b.startswith(b"\x89PNG\r\n\x1a\n")),
++    "pdf": ("pdf", lambda b: b.startswith(b"%PDF")),
++}
++
+ 
++# ------------------------------------------------------------------ access helpers
+ def get_accessible_prescription(db: Session, user: User, prescription_id: int) -> Prescription:
+-    """Return the prescription only if this user is allowed to see it.
+-    Doctor: own prescriptions. Patient: own, verified prescriptions. Admin: all."""
++    """Doctor: own prescriptions. Patient: own, verified prescriptions. Admin: all."""
+     p = db.get(Prescription, prescription_id)
+     if p is None:
+         raise HTTPException(status.HTTP_404_NOT_FOUND, "Prescription not found")
+@@ -29,23 +46,48 @@ def get_accessible_prescription(db: Session, user: User, prescription_id: int) -
+     raise HTTPException(status.HTTP_403_FORBIDDEN, "You do not have access to this prescription")
+ 
+ 
+-def get_owned_editable(db: Session, user: User, prescription_id: int) -> Prescription:
++def get_owned(db: Session, user: User, prescription_id: int) -> Prescription:
+     p = get_accessible_prescription(db, user, prescription_id)
+     if user.role_name != ROLE_DOCTOR:
+         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the prescribing doctor can modify a prescription")
+     return p
+ 
+ 
++def ensure_not_verified(p: Prescription):
++    if p.verification_status == VERIFICATION_VERIFIED:
++        raise HTTPException(status.HTTP_409_CONFLICT, "A verified prescription cannot be edited")
++
++
++def sync_header(p: Prescription):
++    """The prescription row mirrors its first medicine (keeps the Sprint 1 fields consistent)."""
++    if p.medicines:
++        m = p.medicines[0]
++        p.medicine_name, p.dosage, p.frequency, p.duration, p.instructions = (
++            m.medicine_name, m.dosage, m.frequency, m.duration, m.instructions)
++
++
++def _clean(v):
++    return " ".join(v.split()) if isinstance(v, str) else v
++
++
++def _review_status(m: Medicine) -> str:
++    return NEEDS_REVIEW if NOT_DETECTED in (m.medicine_name, m.dosage, m.frequency, m.duration) else CONFIRMED
++
++
++# ------------------------------------------------------------------ Sprint 1: CRUD
+ @router.post("", response_model=PrescriptionOut, status_code=status.HTTP_201_CREATED)
+ def create_prescription(data: PrescriptionCreate, user: User = Depends(require_roles(ROLE_DOCTOR)),
+                         db: Session = Depends(get_db)):
+-    """New prescriptions are always stored as Pending verification."""
++    """Manually entered prescriptions are always stored as Pending verification."""
+     patient = db.get(Patient, data.patient_id)
+     if patient is None or patient.status != "Active":
+         raise HTTPException(status.HTTP_404_NOT_FOUND, "Patient not found")
+-    p = Prescription(**data.model_dump(), doctor_id=user.doctor.doctor_id,
+-                     verification_status=VERIFICATION_PENDING, processing_status=PROC_PENDING_VERIFICATION,
+-                     status="Active")
++    fields = data.model_dump()
++    p = Prescription(**fields, doctor_id=user.doctor.doctor_id, verification_status=VERIFICATION_PENDING,
++                     processing_status=PROC_PENDING_VERIFICATION, status="Active")
++    p.medicines.append(Medicine(**{k: fields[k] for k in
++                                   ("medicine_name", "dosage", "frequency", "duration", "instructions")},
++                                extraction_status=CONFIRMED))  # doctor-entered, so already confirmed
+     db.add(p)
+     db.commit()
+     db.refresh(p)
+@@ -71,15 +113,20 @@ def get_prescription(prescription_id: int, user: User = Depends(get_current_user
+ @router.put("/{prescription_id}", response_model=PrescriptionOut)
+ def update_prescription(prescription_id: int, data: PrescriptionUpdate,
+                         user: User = Depends(require_roles(ROLE_DOCTOR)), db: Session = Depends(get_db)):
+-    p = get_owned_editable(db, user, prescription_id)
++    p = get_owned(db, user, prescription_id)
+     changes = data.model_dump(exclude_unset=True)
+-    content_changed = any(k != "status" for k in changes)
+-    if p.verification_status == VERIFICATION_VERIFIED and content_changed:
+-        raise HTTPException(status.HTTP_409_CONFLICT, "A verified prescription cannot be edited")
++    content = {k: v for k, v in changes.items() if k != "status"}
++    if content:
++        ensure_not_verified(p)
+     for field, value in changes.items():
+         if value is None and field != "instructions":
+             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"{field} cannot be empty")
+-        setattr(p, field, " ".join(value.split()) if isinstance(value, str) and field != "instructions" else value)
++        setattr(p, field, value if field == "instructions" else _clean(value))
++    if content and p.medicines:  # keep first medicine row in step with the header
++        m = p.medicines[0]
++        for field in content:
++            setattr(m, field, getattr(p, field))
++        m.extraction_status = _review_status(m)
+     db.commit()
+     db.refresh(p)
+     return p
+@@ -88,12 +135,181 @@ def update_prescription(prescription_id: int, data: PrescriptionUpdate,
+ @router.post("/{prescription_id}/verify", response_model=PrescriptionOut)
+ def verify_prescription(prescription_id: int, data: VerifyRequest | None = None,
+                         user: User = Depends(require_roles(ROLE_DOCTOR)), db: Session = Depends(get_db)):
+-    p = get_owned_editable(db, user, prescription_id)
++    p = get_owned(db, user, prescription_id)
+     action = data.action if data else "verify"
+     if action == "verify":
++        if any(m.extraction_status == NEEDS_REVIEW for m in p.medicines):
++            raise HTTPException(status.HTTP_409_CONFLICT,
++                                "Some medicines have missing or unconfirmed details. Review and correct them first")
++        if p.files and not p.medicines:
++            raise HTTPException(status.HTTP_409_CONFLICT,
++                                "No medicines were extracted. Add the medicine details before verifying")
++        for m in p.medicines:
++            m.extraction_status = CONFIRMED
+         p.verification_status, p.processing_status = VERIFICATION_VERIFIED, PROC_VERIFIED
+     else:
+         p.verification_status, p.processing_status = VERIFICATION_REJECTED, PROC_REJECTED
+     db.commit()
+     db.refresh(p)
+     return p
++
++
++# ------------------------------------------------------------------ Sprint 2: upload + OCR
++def _validate_upload(file: UploadFile, max_bytes: int) -> tuple[bytes, str]:
++    name = file.filename or ""
++    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
++    if ext not in ALLOWED_TYPES:
++        raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "Only JPG, PNG or PDF files are allowed")
++    content = file.file.read(max_bytes + 1)
++    if not content:
++        raise HTTPException(status.HTTP_400_BAD_REQUEST, "The uploaded file is empty")
++    if len(content) > max_bytes:
++        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
++                            f"File is too large (maximum {max_bytes // (1024 * 1024)} MB)")
++    file_type, magic_ok = ALLOWED_TYPES[ext]
++    if not magic_ok(content):
++        raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "File content does not match its extension")
++    return content, file_type
++
++
++def _process_file(db: Session, p: Prescription, f: PrescriptionFile) -> tuple[str, str]:
++    """Run OCR + extraction, replace existing medicines. Returns (ocr_status, message)."""
++    p.processing_status, f.upload_status = PROC_PROCESSING, FILE_PROCESSING
++    db.commit()
++    try:
++        text = ocr.extract_text(f.stored_file_path, f.file_type)
++    except ocr.OCRUnavailable as exc:
++        f.upload_status, p.processing_status = FILE_FAILED, PROC_UPLOADED
++        db.commit()
++        return "failed", f"Text could not be read from the file ({exc}). Enter the medicines manually"
++
++    for m in list(p.medicines):
++        p.medicines.remove(m)
++    found = extract_medicines(text)
++    for e in found:
++        p.medicines.append(Medicine(
++            medicine_name=e.medicine_name[:150], dosage=e.dosage[:100], frequency=e.frequency[:100],
++            duration=e.duration[:100], instructions=e.instructions,
++            extraction_status=NEEDS_REVIEW if e.needs_review else EXTRACTED))
++    sync_header(p)
++    f.upload_status, p.processing_status = FILE_PROCESSED, PROC_PENDING_VERIFICATION
++    db.commit()
++    if not found:
++        return "no_medicines_found", "No medicines were detected. Please enter them manually"
++    review = sum(m.extraction_status == NEEDS_REVIEW for m in p.medicines)
++    msg = f"{len(found)} medicine(s) extracted"
++    return "success", msg + (f"; {review} need review because some details are missing" if review else "")
++
++
++def _upload_response(p: Prescription, ocr_status: str, message: str) -> UploadResponse:
++    base = PrescriptionOut.model_validate(p).model_dump()
++    return UploadResponse(**base, ocr_status=ocr_status, message=message)
++
++
++@router.post("/upload", response_model=UploadResponse, status_code=status.HTTP_201_CREATED)
++def upload_prescription(patient_id: int = Form(...), prescription_date: date | None = Form(None),
++                        file: UploadFile = File(...), user: User = Depends(require_roles(ROLE_DOCTOR)),
++                        db: Session = Depends(get_db)):
++    """Upload a prescription image/PDF, run OCR and store the extracted medicines for doctor review."""
++    settings = get_settings()
++    patient = db.get(Patient, patient_id)
++    if patient is None or patient.status != "Active":
++        raise HTTPException(status.HTTP_404_NOT_FOUND, "Patient not found")
++    rx_date = prescription_date or date.today()
++    if rx_date > date.today():
++        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "prescription_date cannot be in the future")
++    content, file_type = _validate_upload(file, settings.MAX_UPLOAD_MB * 1024 * 1024)
++
++    upload_dir = Path(settings.UPLOAD_DIR)
++    upload_dir.mkdir(parents=True, exist_ok=True)
++    stored = upload_dir / f"{uuid.uuid4().hex}.{file_type}"   # never use the client's file name on disk
++    stored.write_bytes(content)
++
++    p = Prescription(patient_id=patient_id, doctor_id=user.doctor.doctor_id, prescription_date=rx_date,
++                     medicine_name="Pending extraction", dosage=NOT_DETECTED, frequency=NOT_DETECTED,
++                     duration=NOT_DETECTED, verification_status=VERIFICATION_PENDING,
++                     processing_status=PROC_UPLOADED, status="Active")
++    f = PrescriptionFile(original_file_name=Path(file.filename).name[:255], stored_file_path=str(stored),
++                         file_type=file_type, file_size=len(content))
++    p.files.append(f)
++    db.add(p)
++    db.commit()
++
++    ocr_status, message = _process_file(db, p, f)
++    db.refresh(p)
++    return _upload_response(p, ocr_status, message)
++
++
++@router.post("/{prescription_id}/reprocess", response_model=UploadResponse)
++def reprocess_prescription(prescription_id: int, user: User = Depends(require_roles(ROLE_DOCTOR)),
++                           db: Session = Depends(get_db)):
++    p = get_owned(db, user, prescription_id)
++    ensure_not_verified(p)
++    if not p.files:
++        raise HTTPException(status.HTTP_404_NOT_FOUND, "This prescription has no uploaded file")
++    ocr_status, message = _process_file(db, p, p.files[-1])
++    db.refresh(p)
++    return _upload_response(p, ocr_status, message)
++
++
++@router.get("/{prescription_id}/file")
++def download_file(prescription_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
++    p = get_accessible_prescription(db, user, prescription_id)
++    if not p.files or not Path(p.files[-1].stored_file_path).exists():
++        raise HTTPException(status.HTTP_404_NOT_FOUND, "No file stored for this prescription")
++    f = p.files[-1]
++    return FileResponse(f.stored_file_path, filename=f.original_file_name)
++
++
++# ------------------------------------------------------------------ Sprint 2: extracted medicines
++@router.get("/{prescription_id}/medicines", response_model=list[MedicineOut])
++def list_medicines(prescription_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
++    return get_accessible_prescription(db, user, prescription_id).medicines
++
++
++@router.post("/{prescription_id}/medicines", response_model=MedicineOut, status_code=status.HTTP_201_CREATED)
++def add_medicine(prescription_id: int, data: MedicineCreate, user: User = Depends(require_roles(ROLE_DOCTOR)),
++                 db: Session = Depends(get_db)):
++    p = get_owned(db, user, prescription_id)
++    ensure_not_verified(p)
++    m = Medicine(**data.model_dump(), extraction_status=CONFIRMED)
++    p.medicines.append(m)
++    sync_header(p)
++    db.commit()
++    db.refresh(m)
++    return m
++
++
++def _get_medicine(p: Prescription, medicine_id: int) -> Medicine:
++    m = next((m for m in p.medicines if m.medicine_id == medicine_id), None)
++    if m is None:
++        raise HTTPException(status.HTTP_404_NOT_FOUND, "Medicine not found on this prescription")
++    return m
++
++
++@router.put("/{prescription_id}/medicines/{medicine_id}", response_model=MedicineOut)
++def update_medicine(prescription_id: int, medicine_id: int, data: MedicineUpdate,
++                    user: User = Depends(require_roles(ROLE_DOCTOR)), db: Session = Depends(get_db)):
++    """Doctor corrects extracted details. Once no field is missing the medicine becomes Confirmed."""
++    p = get_owned(db, user, prescription_id)
++    ensure_not_verified(p)
++    m = _get_medicine(p, medicine_id)
++    for field, value in data.model_dump(exclude_unset=True).items():
++        if value is None and field != "instructions":
++            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"{field} cannot be empty")
++        setattr(m, field, value if field == "instructions" else _clean(value))
++    m.extraction_status = _review_status(m)
++    sync_header(p)
++    db.commit()
++    db.refresh(m)
++    return m
++
++
++@router.delete("/{prescription_id}/medicines/{medicine_id}", status_code=status.HTTP_204_NO_CONTENT)
++def delete_medicine(prescription_id: int, medicine_id: int, user: User = Depends(require_roles(ROLE_DOCTOR)),
++                    db: Session = Depends(get_db)):
++    p = get_owned(db, user, prescription_id)
++    ensure_not_verified(p)
++    p.medicines.remove(_get_medicine(p, medicine_id))
++    sync_header(p)
++    db.commit()
+diff --git a/backend/app/schemas.py b/backend/app/schemas.py
+index 37bb5cd..8171466 100644
+--- a/backend/app/schemas.py
++++ b/backend/app/schemas.py
+@@ -190,6 +190,41 @@ class VerifyRequest(BaseModel):
+     action: Literal["verify", "reject"] = "verify"
+ 
+ 
++class MedicineOut(BaseModel):
++    model_config = ConfigDict(from_attributes=True)
++    medicine_id: int
++    prescription_id: int
++    medicine_name: str
++    dosage: str
++    frequency: str
++    duration: str
++    instructions: str | None = None
++    extraction_status: str
++
++
++class MedicineCreate(_MedicineFields):
++    pass
++
++
++class MedicineUpdate(BaseModel):
++    medicine_name: str | None = Field(default=None, min_length=1, max_length=150)
++    dosage: str | None = Field(default=None, min_length=1, max_length=100)
++    frequency: str | None = Field(default=None, min_length=1, max_length=100)
++    duration: str | None = Field(default=None, min_length=1, max_length=100)
++    instructions: str | None = None
++
++
++class FileOut(BaseModel):
++    model_config = ConfigDict(from_attributes=True)
++    file_id: int
++    prescription_id: int
++    original_file_name: str
++    file_type: str
++    file_size: int | None = None
++    upload_date: datetime | None = None
++    upload_status: str
++
++
+ class PrescriptionOut(BaseModel):
+     model_config = ConfigDict(from_attributes=True)
+     prescription_id: int
+@@ -207,3 +242,10 @@ class PrescriptionOut(BaseModel):
+     processing_status: str
+     status: str
+     created_at: datetime | None = None
++    medicines: list[MedicineOut] = []
++    files: list[FileOut] = []
++
++
++class UploadResponse(PrescriptionOut):
++    ocr_status: Literal["success", "no_medicines_found", "failed"]
++    message: str
+diff --git a/backend/app/services/extraction.py b/backend/app/services/extraction.py
+new file mode 100644
+index 0000000..ef0336e
+--- /dev/null
++++ b/backend/app/services/extraction.py
+@@ -0,0 +1,98 @@
++"""Rule-based extraction of medicine name, dosage, frequency, duration and instructions from OCR text."""
++import re
++from dataclasses import dataclass
++
++NOT_DETECTED = "Not detected"
++
++DOSAGE_RE = re.compile(
++    r"(\d+(?:\.\d+)?\s?(?:mg|mcg|µg|ug|g|ml|iu|units?|%)(?:\s?/\s?\d+(?:\.\d+)?\s?(?:ml|mg|g))?)(?![a-z])",
++    re.IGNORECASE)
++
++_FREQ_ABBR = {"OD": "Once daily", "QD": "Once daily", "BD": "Twice daily", "BID": "Twice daily",
++              "TDS": "Three times daily", "TID": "Three times daily", "QID": "Four times daily",
++              "QDS": "Four times daily", "HS": "At bedtime", "SOS": "As needed", "PRN": "As needed"}
++_FREQ_PATTERNS = [
++    (re.compile(r"\b(\d)\s?-\s?(\d)\s?-\s?(\d)(?:\s?-\s?(\d))?\b"), lambda m: m.group(0).replace(" ", "")),
++    (re.compile(r"\b(once|twice|thrice)\s+(?:a\s+|per\s+)?(?:day|daily)\b", re.I), lambda m: m.group(0).capitalize()),
++    (re.compile(r"\b(\d)\s*(?:times|x)\s*(?:a|per)?\s*(?:day|daily)\b", re.I),
++     lambda m: f"{m.group(1)} times daily"),
++    (re.compile(r"\bevery\s+\d+\s*(?:hours?|hrs?|h)\b", re.I), lambda m: m.group(0).capitalize()),
++    (re.compile(r"\b(OD|QD|BD|BID|TDS|TID|QID|QDS|HS|SOS|PRN)\b", re.I), lambda m: _FREQ_ABBR[m.group(1).upper()]),
++    (re.compile(r"\bdaily\b", re.I), lambda m: "Once daily"),
++]
++DURATION_RE = re.compile(r"\b(?:for|x)?\s*(\d+)\s*(days?|weeks?|months?)\b", re.I)
++_INSTRUCTION_RE = re.compile(
++    r"\b(after (?:food|meals?)|before (?:food|meals?)|with (?:food|water|milk)|empty stomach|at bedtime|"
++    r"do not crush|avoid alcohol)\b", re.I)
++_FORM_PREFIX_RE = re.compile(
++    r"^\s*(?:\d+\s*[.)]\s*)?(?:tab(?:let)?s?|cap(?:sule)?s?|syp|syrup|inj(?:ection)?|oint(?:ment)?|drops?|cream|gel)\b\.?\s*",
++    re.I)
++_NUMBERING_RE = re.compile(r"^\s*\d+\s*[.)]\s+")
++
++
++@dataclass
++class ExtractedMedicine:
++    medicine_name: str
++    dosage: str
++    frequency: str
++    duration: str
++    instructions: str | None
++
++    @property
++    def needs_review(self) -> bool:
++        return NOT_DETECTED in (self.medicine_name, self.dosage, self.frequency, self.duration)
++
++
++def _find_frequency(text: str):
++    for pattern, normalise in _FREQ_PATTERNS:
++        m = pattern.search(text)
++        if m:
++            return normalise(m), m
++    return None, None
++
++
++def _find_duration(text: str):
++    m = DURATION_RE.search(text)
++    if not m:
++        return None, None
++    n, unit = int(m.group(1)), m.group(2).lower().rstrip("s")
++    return f"{n} {unit}{'' if n == 1 else 's'}", m
++
++
++def parse_line(line: str) -> ExtractedMedicine | None:
++    """Return a medicine if the line looks like a prescription line, else None."""
++    text = " ".join(line.split())
++    dosage_m = DOSAGE_RE.search(text)
++    has_prefix = bool(_FORM_PREFIX_RE.match(text))
++    if not dosage_m and not has_prefix:
++        return None
++
++    freq, freq_m = _find_frequency(text)
++    dur, dur_m = _find_duration(text)
++    # a duration like "5 days" must not be confused with a dosage unit; dosage regex has no day units.
++
++    body = _FORM_PREFIX_RE.sub("", text) if has_prefix else _NUMBERING_RE.sub("", text)
++    cut_points = [m.start() for m in (DOSAGE_RE.search(body), _find_frequency(body)[1], _find_duration(body)[1]) if m]
++    name = body[: min(cut_points)] if cut_points else body
++    name = name.strip(" -–:,.;()")
++    if not re.search(r"[A-Za-z]{2,}", name):
++        name = ""
++
++    instr = _INSTRUCTION_RE.findall(text)
++    instructions = "; ".join(dict.fromkeys(i.capitalize() for i in instr)) or None
++    return ExtractedMedicine(
++        medicine_name=name or NOT_DETECTED,
++        dosage=re.sub(r"\s+", " ", dosage_m.group(1)).strip() if dosage_m else NOT_DETECTED,
++        frequency=freq or NOT_DETECTED,
++        duration=dur or NOT_DETECTED,
++        instructions=instructions)
++
++
++def extract_medicines(text: str) -> list[ExtractedMedicine]:
++    meds = []
++    for line in text.splitlines():
++        if line.strip():
++            med = parse_line(line)
++            if med:
++                meds.append(med)
++    return meds
+diff --git a/backend/app/services/ocr.py b/backend/app/services/ocr.py
+new file mode 100644
+index 0000000..6818b1c
+--- /dev/null
++++ b/backend/app/services/ocr.py
+@@ -0,0 +1,35 @@
++"""OCR processing module. Images -> Tesseract; PDFs -> embedded text first, then OCR of rendered pages."""
++from pathlib import Path
++
++
++class OCRUnavailable(Exception):
++    """OCR engine (Tesseract / poppler) is not installed or failed."""
++
++
++def extract_text(path: str, file_type: str) -> str:
++    try:
++        if file_type == "pdf":
++            return _pdf_text(path)
++        return _image_text(path)
++    except OCRUnavailable:
++        raise
++    except Exception as exc:  # corrupt file, missing binary, etc.
++        raise OCRUnavailable(f"OCR failed: {exc}") from exc
++
++
++def _image_text(path: str) -> str:
++    import pytesseract
++    from PIL import Image
++    with Image.open(path) as img:
++        return pytesseract.image_to_string(img)
++
++
++def _pdf_text(path: str) -> str:
++    from pypdf import PdfReader
++    text = "\n".join((page.extract_text() or "") for page in PdfReader(path).pages)
++    if text.strip():
++        return text
++    # scanned PDF: render pages and OCR them
++    import pytesseract
++    from pdf2image import convert_from_path
++    return "\n".join(pytesseract.image_to_string(img) for img in convert_from_path(path))
+diff --git a/backend/tests/test_extraction.py b/backend/tests/test_extraction.py
+new file mode 100644
+index 0000000..7174d3a
+--- /dev/null
++++ b/backend/tests/test_extraction.py
+@@ -0,0 +1,45 @@
++import pytest
++from app.services.extraction import NOT_DETECTED, extract_medicines, parse_line
++
++
++@pytest.mark.parametrize("line,name,dosage,freq,dur", [
++    ("Tab. Paracetamol 500 mg BD x 5 days", "Paracetamol", "500 mg", "Twice daily", "5 days"),
++    ("1. Amoxicillin 250mg 1-0-1 for 7 days", "Amoxicillin", "250mg", "1-0-1", "7 days"),
++    ("Cap Omeprazole 20 mg once daily for 2 weeks", "Omeprazole", "20 mg", "Once daily", "2 weeks"),
++    ("Syp. Cetirizine 5 ml TDS 3 days", "Cetirizine", "5 ml", "Three times daily", "3 days"),
++    ("Metformin 500 mg every 12 hours for 1 month", "Metformin", "500 mg", "Every 12 hours", "1 month"),
++    ("Azithromycin 500mg 2 times a day for 1 day", "Azithromycin", "500mg", "2 times daily", "1 day"),
++])
++def test_parse_complete_lines(line, name, dosage, freq, dur):
++    m = parse_line(line)
++    assert (m.medicine_name, m.dosage, m.frequency, m.duration) == (name, dosage, freq, dur)
++    assert not m.needs_review
++
++
++def test_dosage_preserved_exactly():
++    assert parse_line("Tab Levothyroxine 12.5 mcg OD 30 days").dosage == "12.5 mcg"
++    assert parse_line("Syp Amoxicillin 250 mg/5 ml BD 5 days").dosage == "250 mg/5 ml"
++
++
++def test_instructions_captured():
++    m = parse_line("Tab Ibuprofen 400 mg TDS 3 days after food")
++    assert m.instructions == "After food"
++
++
++def test_missing_fields_flagged_for_review():
++    m = parse_line("Tab Paracetamol 500 mg")
++    assert m.frequency == NOT_DETECTED and m.duration == NOT_DETECTED and m.needs_review
++    m = parse_line("Tab Paracetamol BD 5 days")
++    assert m.dosage == NOT_DETECTED and m.needs_review
++
++
++def test_non_medicine_lines_ignored():
++    text = "Dr. Mehta MBBS\nPatient: Asha Rao  Age 31\nDate: 20-10-2026\nRx\nTab Paracetamol 500 mg BD 5 days\nSign"
++    meds = extract_medicines(text)
++    assert [m.medicine_name for m in meds] == ["Paracetamol"]
++
++
++def test_multiple_medicines_and_empty_text():
++    text = "Tab Paracetamol 500 mg BD 5 days\nCap Omeprazole 20 mg OD 14 days"
++    assert len(extract_medicines(text)) == 2
++    assert extract_medicines("") == [] and extract_medicines("random words only") == []
+diff --git a/backend/tests/test_upload_ocr.py b/backend/tests/test_upload_ocr.py
+new file mode 100644
+index 0000000..739cc03
+--- /dev/null
++++ b/backend/tests/test_upload_ocr.py
+@@ -0,0 +1,207 @@
++import io
++
++import pytest
++from app.services import ocr
++from .conftest import patient_id
++
++PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 100
++JPG = b"\xff\xd8\xff\xe0" + b"0" * 100
++OCR_TEXT = "Dr Mehta\nTab Paracetamol 500 mg BD x 5 days after food\nCap Omeprazole 20 mg OD\n"
++
++def make_pdf(text: str) -> bytes:
++    """Build a minimal valid single-page PDF containing `text`."""
++    stream = f"BT /F1 12 Tf 10 100 Td ({text}) Tj ET".encode()
++    objs = [b"<</Type/Catalog/Pages 2 0 R>>", b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
++            b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 400 200]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>",
++            b"<</Length %d>>\nstream\n" % len(stream) + stream + b"\nendstream",
++            b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>"]
++    out, offsets = b"%PDF-1.4\n", []
++    for i, o in enumerate(objs, 1):
++        offsets.append(len(out))
++        out += b"%d 0 obj\n" % i + o + b"\nendobj\n"
++    xref = len(out)
++    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
++    out += b"".join(b"%010d 00000 n \n" % off for off in offsets)
++    return out + b"trailer<</Root 1 0 R/Size %d>>\nstartxref\n%d\n%%%%EOF" % (len(objs) + 1, xref)
++
++
++MINI_PDF = make_pdf("Tab Amoxicillin 250 mg TDS 7 days")
++
++
++@pytest.fixture()
++def fake_ocr(monkeypatch):
++    monkeypatch.setattr(ocr, "extract_text", lambda path, file_type: OCR_TEXT)
++
++
++def upload(client, headers, pid, name="rx.png", content=PNG, **extra):
++    return client.post("/prescriptions/upload", headers=headers, data={"patient_id": str(pid), **extra},
++                       files={"file": (name, io.BytesIO(content))})
++
++
++def test_upload_extracts_medicines_and_awaits_verification(client, patient, doctor, fake_ocr):
++    pid = patient_id(client, doctor["headers"])
++    r = upload(client, doctor["headers"], pid)
++    assert r.status_code == 201, r.text
++    b = r.json()
++    assert b["ocr_status"] == "success"
++    assert b["processing_status"] == "Pending Verification" and b["verification_status"] == "Pending"
++    assert b["files"][0]["upload_status"] == "Processed" and b["files"][0]["file_type"] == "png"
++    names = [m["medicine_name"] for m in b["medicines"]]
++    assert names == ["Paracetamol", "Omeprazole"]
++    assert b["medicine_name"] == "Paracetamol" and b["dosage"] == "500 mg"  # header mirrors first medicine
++    omep = b["medicines"][1]
++    assert omep["extraction_status"] == "Needs Review" and omep["duration"] == "Not detected"
++
++
++def test_stored_filename_is_not_client_name(client, patient, doctor, fake_ocr, db):
++    from app.models import PrescriptionFile
++    pid = patient_id(client, doctor["headers"])
++    upload(client, doctor["headers"], pid, name="../../evil name.png")
++    f = db.query(PrescriptionFile).one()
++    assert "evil" not in f.stored_file_path and f.original_file_name == "evil name.png"
++
++
++@pytest.mark.parametrize("name,content,code", [
++    ("rx.exe", b"MZ" + b"0" * 50, 415),
++    ("rx.txt", b"hello", 415),
++    ("rx", PNG, 415),
++    ("rx.png", JPG, 415),            # content does not match extension
++    ("rx.pdf", PNG, 415),
++    ("rx.png", b"", 400),
++])
++def test_file_validation(client, patient, doctor, fake_ocr, name, content, code):
++    pid = patient_id(client, doctor["headers"])
++    assert upload(client, doctor["headers"], pid, name=name, content=content).status_code == code
++
++
++def test_oversize_file_rejected(client, patient, doctor, fake_ocr):
++    pid = patient_id(client, doctor["headers"])
++    big = PNG + b"0" * (5 * 1024 * 1024)
++    assert upload(client, doctor["headers"], pid, content=big).status_code == 413
++
++
++def test_upload_permissions_and_inputs(client, patient, doctor, fake_ocr):
++    pid = patient_id(client, doctor["headers"])
++    assert upload(client, patient["headers"], pid).status_code == 403
++    assert client.post("/prescriptions/upload", data={"patient_id": str(pid)},
++                       files={"file": ("a.png", io.BytesIO(PNG))}).status_code == 401
++    assert upload(client, doctor["headers"], 9999).status_code == 404
++    assert upload(client, doctor["headers"], pid, prescription_date="2999-01-01").status_code == 422
++
++
++def test_ocr_failure_is_handled(client, patient, doctor, monkeypatch):
++    def boom(path, file_type):
++        raise ocr.OCRUnavailable("tesseract not installed")
++    monkeypatch.setattr(ocr, "extract_text", boom)
++    pid = patient_id(client, doctor["headers"])
++    b = upload(client, doctor["headers"], pid).json()
++    assert b["ocr_status"] == "failed" and b["processing_status"] == "Uploaded"
++    assert b["files"][0]["upload_status"] == "Failed" and b["medicines"] == []
++    # doctor falls back to manual entry, then can verify
++    rid = b["prescription_id"]
++    assert client.post(f"/prescriptions/{rid}/verify", headers=doctor["headers"]).status_code == 409
++    m = client.post(f"/prescriptions/{rid}/medicines", headers=doctor["headers"], json={
++        "medicine_name": "Paracetamol", "dosage": "500 mg", "frequency": "Twice daily", "duration": "5 days"})
++    assert m.status_code == 201
++    assert client.post(f"/prescriptions/{rid}/verify", headers=doctor["headers"]).status_code == 200
++
++
++def test_no_medicines_found(client, patient, doctor, monkeypatch):
++    monkeypatch.setattr(ocr, "extract_text", lambda p, t: "Just some handwriting with no drugs")
++    pid = patient_id(client, doctor["headers"])
++    b = upload(client, doctor["headers"], pid).json()
++    assert b["ocr_status"] == "no_medicines_found" and b["processing_status"] == "Pending Verification"
++
++
++def test_real_pdf_text_extraction(client, patient, doctor):
++    """No mocking: embedded-text PDFs go through pypdf + the extraction rules."""
++    pid = patient_id(client, doctor["headers"])
++    b = upload(client, doctor["headers"], pid, name="rx.pdf", content=MINI_PDF).json()
++    assert b["ocr_status"] == "success", b
++    assert b["medicines"][0]["medicine_name"] == "Amoxicillin" and b["medicines"][0]["dosage"] == "250 mg"
++
++
++def test_verification_blocked_until_missing_info_corrected(client, patient, doctor, fake_ocr):
++    pid = patient_id(client, doctor["headers"])
++    rid = upload(client, doctor["headers"], pid).json()["prescription_id"]
++    h = doctor["headers"]
++    assert client.post(f"/prescriptions/{rid}/verify", headers=h).status_code == 409
++    meds = client.get(f"/prescriptions/{rid}/medicines", headers=h).json()
++    needs = next(m for m in meds if m["extraction_status"] == "Needs Review")
++    r = client.put(f"/prescriptions/{rid}/medicines/{needs['medicine_id']}", headers=h, json={"duration": "14 days"})
++    assert r.status_code == 200 and r.json()["extraction_status"] == "Confirmed"
++    v = client.post(f"/prescriptions/{rid}/verify", headers=h)
++    assert v.status_code == 200
++    body = v.json()
++    assert body["verification_status"] == "Verified" and body["processing_status"] == "Verified"
++    assert all(m["extraction_status"] == "Confirmed" for m in body["medicines"])
++    # locked afterwards
++    assert client.put(f"/prescriptions/{rid}/medicines/{needs['medicine_id']}", headers=h,
++                      json={"dosage": "1 g"}).status_code == 409
++    assert client.delete(f"/prescriptions/{rid}/medicines/{needs['medicine_id']}", headers=h).status_code == 409
++    assert client.post(f"/prescriptions/{rid}/reprocess", headers=h).status_code == 409
++
++
++def test_correcting_incorrect_medicine_updates_header(client, patient, doctor, fake_ocr):
++    pid = patient_id(client, doctor["headers"])
++    h = doctor["headers"]
++    b = upload(client, h, pid).json()
++    first = b["medicines"][0]["medicine_id"]
++    client.put(f"/prescriptions/{b['prescription_id']}/medicines/{first}", headers=h,
++               json={"medicine_name": "Dolo", "dosage": "650 mg"})
++    got = client.get(f"/prescriptions/{b['prescription_id']}", headers=h).json()
++    assert got["medicine_name"] == "Dolo" and got["dosage"] == "650 mg"
++
++
++def test_medicine_validation(client, patient, doctor, fake_ocr):
++    pid = patient_id(client, doctor["headers"])
++    h = doctor["headers"]
++    b = upload(client, h, pid).json()
++    rid, mid = b["prescription_id"], b["medicines"][0]["medicine_id"]
++    assert client.put(f"/prescriptions/{rid}/medicines/{mid}", headers=h, json={"dosage": ""}).status_code == 422
++    assert client.put(f"/prescriptions/{rid}/medicines/{mid}", headers=h, json={"dosage": None}).status_code == 422
++    assert client.put(f"/prescriptions/{rid}/medicines/9999", headers=h, json={"dosage": "1 g"}).status_code == 404
++    assert client.post(f"/prescriptions/{rid}/medicines", headers=h, json={"medicine_name": "X"}).status_code == 422
++
++
++def test_reprocess_replaces_medicines(client, patient, doctor, fake_ocr, monkeypatch):
++    pid = patient_id(client, doctor["headers"])
++    h = doctor["headers"]
++    rid = upload(client, h, pid).json()["prescription_id"]
++    monkeypatch.setattr(ocr, "extract_text", lambda p, t: "Tab Aspirin 75 mg OD 30 days")
++    b = client.post(f"/prescriptions/{rid}/reprocess", headers=h).json()
++    assert [m["medicine_name"] for m in b["medicines"]] == ["Aspirin"]
++
++
++def test_file_and_medicine_access_control(client, patient, patient2, doctor, doctor2, admin, fake_ocr):
++    pid = patient_id(client, doctor["headers"])
++    rid = upload(client, doctor["headers"], pid).json()["prescription_id"]
++    mid = client.get(f"/prescriptions/{rid}/medicines", headers=doctor["headers"]).json()[0]["medicine_id"]
++    for path in (f"/prescriptions/{rid}/file", f"/prescriptions/{rid}/medicines"):
++        assert client.get(path, headers=doctor["headers"]).status_code == 200
++        assert client.get(path, headers=admin["headers"]).status_code == 200
++        assert client.get(path, headers=doctor2["headers"]).status_code == 403
++        assert client.get(path, headers=patient2["headers"]).status_code == 403
++        assert client.get(path, headers=patient["headers"]).status_code == 403   # not verified yet
++        assert client.get(path).status_code == 401
++    assert client.put(f"/prescriptions/{rid}/medicines/{mid}", json={"dosage": "1 g"},
++                      headers=doctor2["headers"]).status_code == 403
++    assert client.put(f"/prescriptions/{rid}/medicines/{mid}", json={"dosage": "1 g"},
++                      headers=patient["headers"]).status_code == 403
++    # after verification the owning patient (only) can read
++    client.put(f"/prescriptions/{rid}/medicines/{mid + 1}", headers=doctor["headers"], json={"duration": "5 days"})
++    assert client.post(f"/prescriptions/{rid}/verify", headers=doctor["headers"]).status_code == 200
++    assert client.get(f"/prescriptions/{rid}/medicines", headers=patient["headers"]).status_code == 200
++    assert client.get(f"/prescriptions/{rid}/file", headers=patient["headers"]).status_code == 200
++    assert client.get(f"/prescriptions/{rid}/file", headers=patient2["headers"]).status_code == 403
++
++
++def test_manual_prescription_has_confirmed_medicine_row(client, patient, doctor):
++    from .conftest import rx_payload
++    pid = patient_id(client, doctor["headers"])
++    b = client.post("/prescriptions", json=rx_payload(pid), headers=doctor["headers"]).json()
++    assert len(b["medicines"]) == 1 and b["medicines"][0]["extraction_status"] == "Confirmed"
++    # editing the header edits the medicine row too
++    client.put(f"/prescriptions/{b['prescription_id']}", json={"dosage": "650 mg"}, headers=doctor["headers"])
++    got = client.get(f"/prescriptions/{b['prescription_id']}", headers=doctor["headers"]).json()
++    assert got["medicines"][0]["dosage"] == "650 mg"
+diff --git a/documentation/sprint2/backend_test_results.txt b/documentation/sprint2/backend_test_results.txt
+new file mode 100644
+index 0000000..d710260
+--- /dev/null
++++ b/documentation/sprint2/backend_test_results.txt
+@@ -0,0 +1,85 @@
++tests/test_auth.py::test_register_patient_and_doctor PASSED              [  1%]
++tests/test_auth.py::test_password_is_hashed_in_db PASSED                 [  2%]
++tests/test_auth.py::test_duplicate_email_rejected PASSED                 [  3%]
++tests/test_auth.py::test_email_is_case_insensitive PASSED                [  4%]
++tests/test_auth.py::test_admin_cannot_self_register PASSED               [  5%]
++tests/test_auth.py::test_invalid_patient_inputs[password-short1A] PASSED [  7%]
++tests/test_auth.py::test_invalid_patient_inputs[password-alllowercase1] PASSED [  8%]
++tests/test_auth.py::test_invalid_patient_inputs[password-NoDigitsHere] PASSED [  9%]
++tests/test_auth.py::test_invalid_patient_inputs[email-not-an-email] PASSED [ 10%]
++tests/test_auth.py::test_invalid_patient_inputs[phone-123] PASSED        [ 11%]
++tests/test_auth.py::test_invalid_patient_inputs[name-A] PASSED           [ 13%]
++tests/test_auth.py::test_invalid_patient_inputs[date_of_birth-2999-01-01] PASSED [ 14%]
++tests/test_auth.py::test_missing_patient_fields[name] PASSED             [ 15%]
++tests/test_auth.py::test_missing_patient_fields[email] PASSED            [ 16%]
++tests/test_auth.py::test_missing_patient_fields[password] PASSED         [ 17%]
++tests/test_auth.py::test_missing_patient_fields[date_of_birth] PASSED    [ 19%]
++tests/test_auth.py::test_missing_patient_fields[phone] PASSED            [ 20%]
++tests/test_auth.py::test_missing_patient_fields[preferred_language] PASSED [ 21%]
++tests/test_auth.py::test_doctor_requires_specialization PASSED           [ 22%]
++tests/test_auth.py::test_duplicate_license_rejected PASSED               [ 23%]
++tests/test_auth.py::test_login_success_returns_token_and_role PASSED     [ 25%]
++tests/test_auth.py::test_login_failures_are_indistinguishable PASSED     [ 26%]
++tests/test_auth.py::test_me_requires_valid_token PASSED                  [ 27%]
++tests/test_extraction.py::test_parse_complete_lines[Tab. Paracetamol 500 mg BD x 5 days-Paracetamol-500 mg-Twice daily-5 days] PASSED [ 28%]
++tests/test_extraction.py::test_parse_complete_lines[1. Amoxicillin 250mg 1-0-1 for 7 days-Amoxicillin-250mg-1-0-1-7 days] PASSED [ 29%]
++tests/test_extraction.py::test_parse_complete_lines[Cap Omeprazole 20 mg once daily for 2 weeks-Omeprazole-20 mg-Once daily-2 weeks] PASSED [ 30%]
++tests/test_extraction.py::test_parse_complete_lines[Syp. Cetirizine 5 ml TDS 3 days-Cetirizine-5 ml-Three times daily-3 days] PASSED [ 32%]
++tests/test_extraction.py::test_parse_complete_lines[Metformin 500 mg every 12 hours for 1 month-Metformin-500 mg-Every 12 hours-1 month] PASSED [ 33%]
++tests/test_extraction.py::test_parse_complete_lines[Azithromycin 500mg 2 times a day for 1 day-Azithromycin-500mg-2 times daily-1 day] PASSED [ 34%]
++tests/test_extraction.py::test_dosage_preserved_exactly PASSED           [ 35%]
++tests/test_extraction.py::test_instructions_captured PASSED              [ 36%]
++tests/test_extraction.py::test_missing_fields_flagged_for_review PASSED  [ 38%]
++tests/test_extraction.py::test_non_medicine_lines_ignored PASSED         [ 39%]
++tests/test_extraction.py::test_multiple_medicines_and_empty_text PASSED  [ 40%]
++tests/test_patients_rbac.py::test_patient_profile_get_and_update PASSED  [ 41%]
++tests/test_patients_rbac.py::test_patient_update_validation PASSED       [ 42%]
++tests/test_patients_rbac.py::test_endpoints_require_authentication PASSED [ 44%]
++tests/test_patients_rbac.py::test_doctor_cannot_use_patient_only_endpoint PASSED [ 45%]
++tests/test_patients_rbac.py::test_patient_cannot_list_patients_or_admin PASSED [ 46%]
++tests/test_patients_rbac.py::test_doctor_cannot_access_admin PASSED      [ 47%]
++tests/test_patients_rbac.py::test_admin_access PASSED                    [ 48%]
++tests/test_patients_rbac.py::test_patient_cannot_read_other_patient PASSED [ 50%]
++tests/test_patients_rbac.py::test_doctor_sees_patient_profile_only_after_prescribing PASSED [ 51%]
++tests/test_patients_rbac.py::test_unknown_patient_404 PASSED             [ 52%]
++tests/test_prescriptions.py::test_doctor_creates_prescription_as_pending PASSED [ 53%]
++tests/test_prescriptions.py::test_dosage_text_preserved_exactly PASSED   [ 54%]
++tests/test_prescriptions.py::test_patient_and_admin_cannot_create PASSED [ 55%]
++tests/test_prescriptions.py::test_mandatory_fields_required[medicine_name] PASSED [ 57%]
++tests/test_prescriptions.py::test_mandatory_fields_required[dosage] PASSED [ 58%]
++tests/test_prescriptions.py::test_mandatory_fields_required[frequency] PASSED [ 59%]
++tests/test_prescriptions.py::test_mandatory_fields_required[duration] PASSED [ 60%]
++tests/test_prescriptions.py::test_mandatory_fields_required[prescription_date] PASSED [ 61%]
++tests/test_prescriptions.py::test_mandatory_fields_required[patient_id] PASSED [ 63%]
++tests/test_prescriptions.py::test_blank_fields_rejected[medicine_name] PASSED [ 64%]
++tests/test_prescriptions.py::test_blank_fields_rejected[dosage] PASSED   [ 65%]
++tests/test_prescriptions.py::test_blank_fields_rejected[frequency] PASSED [ 66%]
++tests/test_prescriptions.py::test_blank_fields_rejected[duration] PASSED [ 67%]
++tests/test_prescriptions.py::test_future_date_and_unknown_patient_rejected PASSED [ 69%]
++tests/test_prescriptions.py::test_patient_only_sees_verified_own_prescriptions PASSED [ 70%]
++tests/test_prescriptions.py::test_doctor_only_sees_own_prescriptions PASSED [ 71%]
++tests/test_prescriptions.py::test_admin_can_view_all_but_not_modify PASSED [ 72%]
++tests/test_prescriptions.py::test_update_then_verify_then_locked PASSED  [ 73%]
++tests/test_prescriptions.py::test_reject PASSED                          [ 75%]
++tests/test_prescriptions.py::test_update_cannot_blank_required_field PASSED [ 76%]
++tests/test_prescriptions.py::test_missing_prescription_404 PASSED        [ 77%]
++tests/test_upload_ocr.py::test_upload_extracts_medicines_and_awaits_verification PASSED [ 78%]
++tests/test_upload_ocr.py::test_stored_filename_is_not_client_name PASSED [ 79%]
++tests/test_upload_ocr.py::test_file_validation[rx.exe-MZ00000000000000000000000000000000000000000000000000-415] PASSED [ 80%]
++tests/test_upload_ocr.py::test_file_validation[rx.txt-hello-415] PASSED  [ 82%]
++tests/test_upload_ocr.py::test_file_validation[rx-\x89PNG\r\n\x1a\n0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000-415] PASSED [ 83%]
++tests/test_upload_ocr.py::test_file_validation[rx.png-\xff\xd8\xff\xe00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000-415] PASSED [ 84%]
++tests/test_upload_ocr.py::test_file_validation[rx.pdf-\x89PNG\r\n\x1a\n0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000-415] PASSED [ 85%]
++tests/test_upload_ocr.py::test_file_validation[rx.png--400] PASSED       [ 86%]
++tests/test_upload_ocr.py::test_oversize_file_rejected PASSED             [ 88%]
++tests/test_upload_ocr.py::test_upload_permissions_and_inputs PASSED      [ 89%]
++tests/test_upload_ocr.py::test_ocr_failure_is_handled PASSED             [ 90%]
++tests/test_upload_ocr.py::test_no_medicines_found PASSED                 [ 91%]
++tests/test_upload_ocr.py::test_real_pdf_text_extraction PASSED           [ 92%]
++tests/test_upload_ocr.py::test_verification_blocked_until_missing_info_corrected PASSED [ 94%]
++tests/test_upload_ocr.py::test_correcting_incorrect_medicine_updates_header PASSED [ 95%]
++tests/test_upload_ocr.py::test_medicine_validation PASSED                [ 96%]
++tests/test_upload_ocr.py::test_reprocess_replaces_medicines PASSED       [ 97%]
++tests/test_upload_ocr.py::test_file_and_medicine_access_control PASSED   [ 98%]
++tests/test_upload_ocr.py::test_manual_prescription_has_confirmed_medicine_row PASSED [100%]
++=================== 84 passed, 1 warning in 65.34s (0:01:05) ===================
+-- 
+2.43.0
+
