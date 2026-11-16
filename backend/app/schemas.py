@@ -190,6 +190,41 @@ class VerifyRequest(BaseModel):
     action: Literal["verify", "reject"] = "verify"
 
 
+class MedicineOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    medicine_id: int
+    prescription_id: int
+    medicine_name: str
+    dosage: str
+    frequency: str
+    duration: str
+    instructions: str | None = None
+    extraction_status: str
+
+
+class MedicineCreate(_MedicineFields):
+    pass
+
+
+class MedicineUpdate(BaseModel):
+    medicine_name: str | None = Field(default=None, min_length=1, max_length=150)
+    dosage: str | None = Field(default=None, min_length=1, max_length=100)
+    frequency: str | None = Field(default=None, min_length=1, max_length=100)
+    duration: str | None = Field(default=None, min_length=1, max_length=100)
+    instructions: str | None = None
+
+
+class FileOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    file_id: int
+    prescription_id: int
+    original_file_name: str
+    file_type: str
+    file_size: int | None = None
+    upload_date: datetime | None = None
+    upload_status: str
+
+
 class PrescriptionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     prescription_id: int
@@ -207,3 +242,10 @@ class PrescriptionOut(BaseModel):
     processing_status: str
     status: str
     created_at: datetime | None = None
+    medicines: list[MedicineOut] = []
+    files: list[FileOut] = []
+
+
+class UploadResponse(PrescriptionOut):
+    ocr_status: Literal["success", "no_medicines_found", "failed"]
+    message: str
