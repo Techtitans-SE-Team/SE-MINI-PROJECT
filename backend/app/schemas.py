@@ -1,5 +1,6 @@
+
 import re
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
@@ -16,12 +17,10 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=72)
     role: Literal["Patient", "Doctor"]
-    # patient fields
     date_of_birth: date | None = None
     phone: str | None = None
     preferred_language: str | None = Field(default=None, max_length=50)
     address: str | None = Field(default=None, max_length=255)
-    # doctor fields
     specialization: str | None = Field(default=None, max_length=100)
     qualification: str | None = Field(default=None, max_length=100)
     license_number: str | None = Field(default=None, max_length=50)
@@ -149,6 +148,7 @@ class DoctorOut(BaseModel):
 
 
 # ---------------- Prescriptions ----------------
+
 class _MedicineFields(BaseModel):
     medicine_name: str = Field(min_length=1, max_length=150)
     dosage: str = Field(min_length=1, max_length=100)
@@ -249,3 +249,25 @@ class PrescriptionOut(BaseModel):
 class UploadResponse(PrescriptionOut):
     ocr_status: Literal["success", "no_medicines_found", "failed"]
     message: str
+
+
+# ---------------- Medicine Reminders ----------------
+
+class MedicineReminderCreate(BaseModel):
+    medicine_id: int
+    reminder_time: time
+
+
+class MedicineReminderOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    reminder_id: int
+    medicine_id: int
+    patient_id: int
+    reminder_time: time
+    is_active: bool
+    created_at: datetime | None = None
+
+
+class MedicineReminderUpdate(BaseModel):
+    reminder_time: time | None = None
+    is_active: bool | None = None

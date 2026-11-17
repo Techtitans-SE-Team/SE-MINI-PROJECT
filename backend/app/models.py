@@ -1,8 +1,20 @@
+
 """ORM models mapped to the MySQL schema in /database/schema (Member 3).
 Enum-like columns are plain strings validated in the API layer."""
-from datetime import date, datetime
+from datetime import date, datetime, time
 
-from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Date,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    Time,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -134,3 +146,20 @@ class PrescriptionFile(Base):
     upload_status: Mapped[str] = mapped_column(String(20), default=FILE_UPLOADED)
 
     prescription: Mapped[Prescription] = relationship(back_populates="files")
+
+
+class MedicineReminder(Base):
+    __tablename__ = "medicine_reminders"
+
+    reminder_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    medicine_id: Mapped[int] = mapped_column(
+        ForeignKey("medicines.medicine_id", ondelete="CASCADE"),
+        nullable=False
+    )
+    patient_id: Mapped[int] = mapped_column(
+        ForeignKey("patients.patient_id", ondelete="CASCADE"),
+        nullable=False
+    )
+    reminder_time: Mapped[time] = mapped_column(Time, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

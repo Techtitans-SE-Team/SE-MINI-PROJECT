@@ -1,3 +1,4 @@
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -7,19 +8,26 @@ from sqlalchemy import select
 from . import models
 from .config import get_settings
 from .database import Base, SessionLocal, engine
-from .routers import admin, auth, patients, prescriptions
+from .routers import admin, auth, patients, prescriptions, reminders
 
 settings = get_settings()
 
 
-def init_db() -> None:
+def init_db():
     if settings.AUTO_CREATE_TABLES:
         Base.metadata.create_all(bind=engine)
-    with SessionLocal() as db:  # make sure the three roles exist
+
+    with SessionLocal() as db:
         existing = set(db.scalars(select(models.Role.role_name)))
-        for name in (models.ROLE_DOCTOR, models.ROLE_PATIENT, models.ROLE_ADMIN):
+
+        for name in (
+            models.ROLE_DOCTOR,
+            models.ROLE_PATIENT,
+            models.ROLE_ADMIN,
+        ):
             if name not in existing:
                 db.add(models.Role(role_name=name))
+
         db.commit()
 
 
@@ -29,14 +37,27 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Doctor Prescription Reminder API", version="1.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins_list, allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(
+    title="Doctor Prescription Reminder API",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Routers
 app.include_router(auth.router)
 app.include_router(patients.router)
 app.include_router(prescriptions.router)
 app.include_router(admin.router)
+app.include_router(reminders.router)
 
 
 @app.get("/health", tags=["System"])
