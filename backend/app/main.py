@@ -1,4 +1,5 @@
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -8,7 +9,8 @@ from sqlalchemy import select
 from . import models
 from .config import get_settings
 from .database import Base, SessionLocal, engine
-from .routers import admin, auth, patients, prescriptions, reminders
+from .routers import admin, auth, media, notifications, patients, prescriptions, reminders
+from .services.scheduler import scheduler_loop
 
 settings = get_settings()
 
@@ -34,7 +36,10 @@ def init_db():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    task = asyncio.create_task(scheduler_loop(SessionLocal)) if settings.ENABLE_SCHEDULER else None
     yield
+    if task:
+        task.cancel()
 
 
 app = FastAPI(
@@ -58,6 +63,8 @@ app.include_router(patients.router)
 app.include_router(prescriptions.router)
 app.include_router(admin.router)
 app.include_router(reminders.router)
+app.include_router(media.router)
+app.include_router(notifications.router)
 
 
 @app.get("/health", tags=["System"])

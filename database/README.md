@@ -216,3 +216,10 @@ The database module can be integrated with the backend to support:
 - Prescription verification workflows.
 - Multilingual reminder generation.
 - Video and audio reminder management.
+
+## Added for reminders, multilingual media and notifications
+| Script | Table | Purpose |
+|---|---|---|
+| 09_create_medicine_reminders.sql | medicine_reminders | Reminder time per medicine and patient |
+| 10_create_instruction_media.sql | instruction_media | Translated text + audio/video paths per medicine and language (unique per medicine+language) |
+| 11_create_notifications.sql | notifications | One in-app notification per reminder per day |

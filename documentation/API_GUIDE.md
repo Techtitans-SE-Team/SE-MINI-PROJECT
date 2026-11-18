@@ -181,3 +181,39 @@ For 401/403/404/409, `detail` is a string. Only 422 returns a list.
 4. Log in as the Patient: `GET /prescriptions` now shows it (patients only see verified ones).
 
 `GET /admin/stats` returns `{ "users": n, "patients": n, "doctors": n, "prescriptions": n }`.
+
+## 7. Reminders, translated instructions, audio/video and notifications (new)
+
+**Flow for the patient screen:** doctor verifies a prescription -> backend automatically builds the translated instruction, audio and video in the patient's preferred language -> patient opens it from `GET /prescriptions/{id}/media`.
+
+### Media item
+```json
+{ "media_id": 4, "prescription_id": 12, "medicine_id": 9, "language_code": "kn", "language_name": "Kannada",
+  "source_text": "Take Paracetamol, 500 mg, Twice daily, for 5 days. After food.",
+  "translated_text": "...", "translated": true, "has_audio": true, "has_video": true,
+  "status": "Completed", "message": null }
+```
+`status`: **Completed**, **Partial** (something fell back, read `message`, e.g. translation was rate limited so English is shown) or **Failed**. Show `translated_text`; play the files only when `has_audio` / `has_video` is true.
+
+| Method | Path | Who | Notes |
+|---|---|---|---|
+| GET | `/languages` | public | `[{name, code}]` for the language dropdown |
+| POST | `/prescriptions/{id}/media?language=Hindi` | Doctor (own) / Patient (own, verified) | Generates (or returns existing) items; language optional. 409 if not verified, 422 if unsupported |
+| GET | `/prescriptions/{id}/media` | same as prescription | List items |
+| GET | `/media/{media_id}/video` | same as prescription | MP4. Use `fetch` with the Authorization header and `URL.createObjectURL(blob)` for `<video src>` (a plain `<video src>` cannot send the token) |
+| GET | `/media/{media_id}/audio` | same | MP3, same approach |
+
+### Reminders (Patient only)
+| Method | Path | Body / notes |
+|---|---|---|
+| POST | `/reminders` | `{ "medicine_id": 9, "reminder_time": "08:00:00" }`, 409 if the same time already exists |
+| POST | `/reminders/auto/{prescription_id}` | Creates times from the frequency. Returns `{ "created": [...], "needs_manual_time": ["MedicineName"] }` |
+| GET | `/reminders` | list; `/reminders/due` = active reminders whose time has passed today |
+| PATCH | `/reminders/{id}` | `{ "reminder_time": "09:00:00" }` and/or `{ "is_active": false }` |
+| DELETE | `/reminders/{id}` | 204 |
+
+### Notifications (Patient only)
+Notification: `{ notification_id, reminder_id, medicine_id, media_id, message, notify_date, reminder_time, status: "Unread"|"Read" }`
+- `POST /notifications/check` -> `{ "created": n }` — call every minute while the app is open.
+- `GET /notifications?unread_only=true` — show badge/list; `media_id` (if set) lets you open the video.
+- `POST /notifications/{id}/read`.

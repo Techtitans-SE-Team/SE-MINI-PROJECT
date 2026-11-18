@@ -271,3 +271,33 @@ class MedicineReminderOut(BaseModel):
 class MedicineReminderUpdate(BaseModel):
     reminder_time: time | None = None
     is_active: bool | None = None
+
+
+# ---------------- Multilingual media + notifications ----------------
+class MediaOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    media_id: int
+    prescription_id: int
+    medicine_id: int
+    language_code: str
+    language_name: str
+    source_text: str
+    translated_text: str
+    translated: bool
+    has_audio: bool
+    has_video: bool
+    status: Literal["Completed", "Partial", "Failed"]
+    message: str | None = None
+
+
+class NotificationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    notification_id: int
+    reminder_id: int
+    medicine_id: int
+    media_id: int | None = None
+    message: str
+    notify_date: date
+    reminder_time: time
+    status: str
+    created_at: datetime | None = None

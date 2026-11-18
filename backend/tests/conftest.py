@@ -3,6 +3,10 @@ import os
 os.environ["DATABASE_URL"] = "sqlite://"
 os.environ["AUTO_CREATE_TABLES"] = "true"
 os.environ["SECRET_KEY"] = "test-secret"
+os.environ["ENABLE_SCHEDULER"] = "false"
+os.environ["AUTO_GENERATE_MEDIA"] = "false"
+os.environ["EXTERNAL_BASE_DELAY"] = "0"
+os.environ["EXTERNAL_MIN_INTERVAL"] = "0"
 
 import pytest
 from fastapi.testclient import TestClient
@@ -34,6 +38,7 @@ def db():
 def client(db, tmp_path):
     from app.config import get_settings
     get_settings().UPLOAD_DIR = str(tmp_path / "uploads")
+    get_settings().MEDIA_DIR = str(tmp_path / "media")
 
     def _get_db():
         yield db
