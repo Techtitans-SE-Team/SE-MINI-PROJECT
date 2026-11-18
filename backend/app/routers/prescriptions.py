@@ -2,7 +2,7 @@ import uuid
 from datetime import date
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -16,7 +16,7 @@ from ..models import (CONFIRMED, EXTRACTED, FILE_FAILED, FILE_PROCESSED, FILE_PR
                       VERIFICATION_VERIFIED, Medicine, Patient, Prescription, PrescriptionFile, User)
 from ..schemas import (MedicineCreate, MedicineOut, MedicineUpdate, PrescriptionCreate, PrescriptionOut,
                        PrescriptionUpdate, UploadResponse, VerifyRequest)
-from ..services import ocr
+from ..services import media_pipeline, ocr
 from ..services.extraction import NOT_DETECTED, extract_medicines
 
 router = APIRouter(prefix="/prescriptions", tags=["Prescriptions"])
@@ -133,7 +133,7 @@ def update_prescription(prescription_id: int, data: PrescriptionUpdate,
 
 
 @router.post("/{prescription_id}/verify", response_model=PrescriptionOut)
-def verify_prescription(prescription_id: int, data: VerifyRequest | None = None,
+def verify_prescription(prescription_id: int, background: BackgroundTasks, data: VerifyRequest | None = None,
                         user: User = Depends(require_roles(ROLE_DOCTOR)), db: Session = Depends(get_db)):
     p = get_owned(db, user, prescription_id)
     action = data.action if data else "verify"
@@ -151,7 +151,14 @@ def verify_prescription(prescription_id: int, data: VerifyRequest | None = None,
         p.verification_status, p.processing_status = VERIFICATION_REJECTED, PROC_REJECTED
     db.commit()
     db.refresh(p)
+    if action == "verify" and settings_auto_media():
+        # translation + audio + video for the patient's language, after the response is sent
+        background.add_task(media_pipeline.auto_generate, db.get_bind(), p.prescription_id)
     return p
+
+
+def settings_auto_media() -> bool:
+    return get_settings().AUTO_GENERATE_MEDIA
 
 
 # ------------------------------------------------------------------ Sprint 2: upload + OCR

@@ -1,8 +1,21 @@
+
 """ORM models mapped to the MySQL schema in /database/schema (Member 3).
 Enum-like columns are plain strings validated in the API layer."""
-from datetime import date, datetime
+from datetime import date, datetime, time
 
-from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    UniqueConstraint,
+    Boolean,
+    Date,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    Time,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -134,3 +147,68 @@ class PrescriptionFile(Base):
     upload_status: Mapped[str] = mapped_column(String(20), default=FILE_UPLOADED)
 
     prescription: Mapped[Prescription] = relationship(back_populates="files")
+
+
+class MedicineReminder(Base):
+    __tablename__ = "medicine_reminders"
+
+    reminder_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    medicine_id: Mapped[int] = mapped_column(
+        ForeignKey("medicines.medicine_id", ondelete="CASCADE"),
+        nullable=False
+    )
+    patient_id: Mapped[int] = mapped_column(
+        ForeignKey("patients.patient_id", ondelete="CASCADE"),
+        nullable=False
+    )
+    reminder_time: Mapped[time] = mapped_column(Time, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class InstructionMedia(Base):
+    """Translated instruction + audio + video generated for one medicine in one language."""
+    __tablename__ = "instruction_media"
+    __table_args__ = (UniqueConstraint("medicine_id", "language_code", name="uq_media_medicine_language"),)
+
+    media_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    prescription_id: Mapped[int] = mapped_column(ForeignKey("prescriptions.prescription_id", ondelete="CASCADE"), nullable=False)
+    medicine_id: Mapped[int] = mapped_column(ForeignKey("medicines.medicine_id", ondelete="CASCADE"), nullable=False)
+    language_code: Mapped[str] = mapped_column(String(10), nullable=False)
+    language_name: Mapped[str] = mapped_column(String(50), nullable=False)
+    source_text: Mapped[str] = mapped_column(Text, nullable=False)
+    translated_text: Mapped[str] = mapped_column(Text, nullable=False)
+    translated: Mapped[bool] = mapped_column(Boolean, default=True)
+    audio_path: Mapped[str | None] = mapped_column(String(500))
+    video_path: Mapped[str | None] = mapped_column(String(500))
+    status: Mapped[str] = mapped_column(String(20), default="Completed")  # Completed / Partial / Failed
+    message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    prescription: Mapped[Prescription] = relationship()
+    medicine: Mapped[Medicine] = relationship()
+
+    @property
+    def has_audio(self) -> bool:
+        return bool(self.audio_path)
+
+    @property
+    def has_video(self) -> bool:
+        return bool(self.video_path)
+
+
+class Notification(Base):
+    """In-app notification created when a reminder time is reached (one per reminder per day)."""
+    __tablename__ = "notifications"
+    __table_args__ = (UniqueConstraint("reminder_id", "notify_date", name="uq_notification_reminder_day"),)
+
+    notification_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    patient_id: Mapped[int] = mapped_column(ForeignKey("patients.patient_id", ondelete="CASCADE"), nullable=False)
+    reminder_id: Mapped[int] = mapped_column(ForeignKey("medicine_reminders.reminder_id", ondelete="CASCADE"), nullable=False)
+    medicine_id: Mapped[int] = mapped_column(ForeignKey("medicines.medicine_id", ondelete="CASCADE"), nullable=False)
+    media_id: Mapped[int | None] = mapped_column(ForeignKey("instruction_media.media_id", ondelete="SET NULL"))
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    notify_date: Mapped[date] = mapped_column(Date, nullable=False)
+    reminder_time: Mapped[time] = mapped_column(Time, nullable=False)
+    status: Mapped[str] = mapped_column(String(10), default="Unread")  # Unread / Read
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
